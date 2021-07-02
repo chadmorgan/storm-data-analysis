@@ -1,0 +1,9 @@
+base
+readr
+lubridate
+dplyr
+tibble
+ggplot2
+stringr
+tidyr
+scales

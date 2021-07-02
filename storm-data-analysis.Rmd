@@ -1,0 +1,542 @@
+---
+title: "Analysis of the public health and economic effects of storms"
+author: "Chad Morgan"
+date: "6/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Synopsis
+
+To assess the impact of different types of natural disasters on the economy and public health, I analyzed storm data from NOAA from the years 1950 to 2011. 
+
+Prior to the mid-nineties, less event types were covered and they were less consistently recorded. The event types field is not consistent or standardized, containing many similar values and some misspellings. To properly group the events, I used string pattern matching to standardize the classification of event types, focusing on the highest impact events. 
+
+Economic impact was measured by the combined property and crop damages, adjusted for inflation using CPI data from FRED.  Public health impact was measured by the number of injuries and deaths.
+
+Because of the wide differences in event frequencies, the total impacts per year were computed to compare the impact of each event type. These yearly totals showed that floods are very common and have the greatest economic impact at a median \$2.6B in damages per year, tornadoes cause the most injuries with a median 1060 per year, and excessive heat causes the most deaths with a median 83 per year. Hurricanes are relatively rare but cause the third highest damages per year with a median \$1.1B per year.
+
+
+# Data Processing 
+
+```{r}
+library(readr)
+library(lubridate)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+theme_set(theme_minimal())
+options(scipen=6)
+set.seed(789)
+```
+
+
+Refer to the [Storm Data Documentation](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf) from the NWS for more information
+
+### Reading the data from CSV
+
+The CSV file was downloaded from the Reproducible Research course site.
+
+```{r cache=TRUE}
+storm_data_raw <- read_csv("repdata_data_StormData.csv.bz2", 
+    col_types = cols(BGN_RANGE = col_double(), 
+        BGN_AZI = col_character(), BGN_LOCATI = col_character(), 
+        END_DATE = col_character(), END_TIME = col_character(), 
+        COUNTYENDN = col_character(), END_AZI = col_character(), 
+        END_LOCATI = col_character(), CROPDMGEXP = col_character(), 
+        WFO = col_character(), STATEOFFIC = col_character(), 
+        ZONENAMES = col_character(), REMARKS = col_character()))
+```
+
+```{r}
+str(storm_data_raw)
+```
+
+## Processing date time fields
+
+Convert the character date fields to date format and extract the year and month.
+
+According to the data documentation, additional lines should be in the data if the event spans over several months
+
+```{r}
+storm_data_raw$begin_date <- mdy_hms(storm_data_raw$BGN_DATE)
+storm_data_raw$end_date <- mdy_hms(storm_data_raw$END_DATE)
+
+storm_data_raw$event_year <-year(storm_data_raw$begin_date)
+storm_data_raw$event_month <-month(storm_data_raw$begin_date)
+```
+
+
+```{r}
+storm_data_raw %>%
+    head() %>%
+    select(BGN_DATE,begin_date,event_year,event_month)
+```
+
+## Processing damage dollar value fields
+
+#### Examine damage fields
+
+From the data documentation:
+
+> Estimates should be rounded to three significant digits, followed by an alphabetical character signifying the magnitude of the number, i.e., 1.55B for $1,550,000,000.  Alphabetical characters used to signify magnitude include “K” for thousands, “M” for millions, and “B” for billions
+
+So PROPDMGEXP should contain a character K, M, B, etc. to indicate the magnitude of the dollar amount in PROPDMG
+
+```{r}
+storm_data_raw %>%
+    filter(PROPDMG>0) %>%
+    group_by(PROPDMGEXP) %>%
+    summarize(n=n()) %>% 
+    arrange(desc(n))
+
+```
+
+```{r}
+storm_data_raw %>%
+    filter(CROPDMG>0) %>%
+    group_by(CROPDMGEXP) %>%
+    summarize(n=n()) %>% 
+    arrange(desc(n))
+
+```
+
+
+We are seeing some digits and the characters + and -, which were not expected. Let's take a look at some of these rows
+
+```{r}
+storm_data_raw %>%
+    filter(PROPDMGEXP == '0' & PROPDMG>0) %>%
+    select(BGN_DATE,PROPDMG,REMARKS) %>% 
+    head
+```
+
+Unfortunately I can't clearly tell what these other values for PROPDMGEXP could mean, so I will treat those property damage values as missing values. 
+
+#### Damage field cleanup and processing
+
+Below we will make a quick function to calculate the damage value from the DMG and EXP values
+
+```{r}
+get_damage_value <- function(DMG,DMG_EXP){
+    
+    exp_lookup <- data.frame(tribble(
+        ~exp_value, ~damage_multiplier,
+        'h',100,
+        'H',100,
+        'k',1000,
+        'K',1000,
+        'm',1e6,
+        'M',1e6,
+        'B',1e9
+    ))
+    
+    mult_v <- exp_lookup[match(DMG_EXP,exp_lookup$exp_value),'damage_multiplier']
+    result <- ifelse(DMG == 0,DMG,DMG*mult_v)
+    
+    return(result)
+}
+```
+
+
+```{r}
+# a few quick tests of the fucnction
+get_damage_value(c(2,12,1,0,1),c('h','m','B','+','+'))
+```
+
+Use our function to calculate the damages to property and crops
+
+```{r}
+storm_data_raw <- storm_data_raw %>%
+    mutate(
+        property_damage_value = get_damage_value(as.numeric(PROPDMG),PROPDMGEXP),
+        crop_damage_value = get_damage_value(as.numeric(CROPDMG),CROPDMGEXP),
+        total_damages = property_damage_value + crop_damage_value
+    )
+```
+
+Check some rows to verify the calculation worked
+
+```{r}
+storm_data_raw %>%
+    select(PROPDMG,PROPDMGEXP,property_damage_value) %>%
+    filter(PROPDMG>0) %>%
+    sample_n(10)
+```
+## Adjust dollar values for inflation
+
+Since we have data spanning decades, we should adjust the dollars for the effects of inflation 
+
+### download CPI data
+
+We can download monthly CPI values from FRED at https://fred.stlouisfed.org/data/CPIAUCNS.txt
+
+Below is the header of this data:
+
+```
+
+Title:               Consumer Price Index for All Urban Consumers: All Items in U.S. City Average
+Series ID:           CPIAUCNS
+Source:              U.S. Bureau of Labor Statistics
+Release:             Consumer Price Index
+Seasonal Adjustment: Not Seasonally Adjusted
+Frequency:           Monthly
+Units:               Index 1982-1984=100
+Date Range:          1913-01-01 to 2021-04-01
+Last Updated:        2021-05-12 7:38 AM CDT
+Notes:               Handbook of Methods (https://www.bls.gov/opub/hom/pdf/cpihom.pdf)
+                     Understanding the CPI: Frequently Asked Questions
+                     (https://www.bls.gov/cpi/questions-and-answers.htm)
+                     
+```
+
+```{r}
+cpi_monthly <- read_table('https://fred.stlouisfed.org/data/CPIAUCNS.txt',skip=13)
+```
+
+
+Reindex the CPI values relative to Nov 2011, the last month available in the storm dataset 
+
+```{r}
+cpi_monthly <- cpi_monthly %>%
+    mutate(
+        year = year(DATE),
+        month = month(DATE)
+    )
+
+cpi_nov2011 <- cpi_monthly %>%
+    filter(year == 2011 & month == 11) %>%
+    select(VALUE) %>%
+    as.numeric
+
+cpi2011_table <- cpi_monthly %>%
+    mutate(
+        cpi_base2011 = (VALUE / cpi_nov2011)
+    ) %>%
+    select(year,month,cpi_base2011) %>%
+    rename(
+        event_year = year,
+        event_month = month
+    )
+```
+
+Adjust the damage dollars using the CPI
+
+```{r}
+storm_data_raw <- storm_data_raw %>%
+    left_join(cpi2011_table,by = c('event_year','event_month')) %>%
+    mutate(
+        damages_adjusted = total_damages / cpi_base2011
+    )
+```
+
+
+
+## Fatalities and injuries processing 
+
+Check the fatalities and injuries fields to make sure they look OK to use
+
+```{r}
+storm_data_raw %>%
+    select(FATALITIES,INJURIES) %>%
+    summary
+```
+
+These values look good and don't seem to need imputation or any other pre-processing
+
+
+
+## Standardize and reduce the event types to the most important
+
+There are many event types with inconsistent values that should be standardized before proceeding
+
+
+```{r}
+storm_data_raw %>% 
+    group_by(EVTYPE) %>%
+    summarize(
+        obs=n(),
+        log10_damages = log10(sum(damages_adjusted,na.rm=TRUE)+1),
+        total_deaths = sum(FATALITIES)
+    ) %>%
+    arrange(desc(obs)) %>%
+    head(10)
+```
+
+
+Make a function to help us standardize the event classification using pattern matching
+
+```{r cache=TRUE}
+simplify_event_types <- function(raw_event_types){
+    
+    pattern_helper <- function(input_string,output_string,replace_value,pattern_list){
+
+        
+        detection_output <- lapply(input_string, function(u) pattern_list[str_detect(u, pattern_list)])
+        nr_matches <- unlist(lapply(detection_output,length))
+        
+        return(ifelse(nr_matches>0,replace_value,output_string))
+    }
+    
+    evnt_in <- str_to_lower(raw_event_types)
+    evnt_out <- rep('',length(raw_event_types))
+    
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'wind',c('wind','wnd','gust'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'rain',c('rain','precipitation','precipatation'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'lightning',c('lightning','ligntning','lighting'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'hail',c('hail'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'thunderstorm',c('thunderstorm','tstm'))
+    
+    
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'cold',c('cold','wind chill','windchill','freeze','frost','low temp','cool','record low'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'winter weather / blizzard',c('winter','wintry','ice','blizzard','snow','freezing rain','sleet'))
+    
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'flood ',c('flood','fld','rising water','floood'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'storm surge/tsunami ',c('storm surge','tsunami'))
+    
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'rip current/high surf',c('rip current','surf','seas'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'avalanche/slide',c('avalanche','avalance','mudslide','slide','landslump'))
+    
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'tornado',c('tornado','torndao'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'hurricane',c('hurricane','typhoon'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'tropical storm/depression',c('tropical storm','tropical depression'))
+    
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'wildfire',c('wildfire','forest fire','wild fire','brush fire','grass fire'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'heat',c('heat','warm','high temp','hot','record high'))
+    evnt_out <- pattern_helper(evnt_in,evnt_out,'drought',c('drought'))
+    
+    evnt_out <- ifelse(evnt_out=='','other',evnt_out)
+    
+    return(evnt_out)
+    
+}
+```
+
+Apply our function to the EVTYPE values
+
+```{r}
+event_type_map <- data.frame('EVTYPE' = unique(storm_data_raw$EVTYPE))
+event_type_map$event_type <- simplify_event_types(event_type_map$EVTYPE)
+```
+
+Join the mappings back to the dataset
+
+```{r}
+storm_data_raw <- storm_data_raw %>%
+    left_join(event_type_map,by = 'EVTYPE')
+```
+
+```{r}
+storm_data_raw %>%
+    group_by(event_type) %>%
+    summarize( obs=n(),
+        log10_damages = log10(sum(damages_adjusted,na.rm=TRUE)+1),
+        total_deaths = sum(FATALITIES)
+    ) %>%
+    arrange(desc(total_deaths))
+```
+
+
+
+## Narrow the dataset 
+
+Keep only the columns we need for analysis and exclude event types of "other"
+
+```{r}
+storm_data_filtered <- storm_data_raw %>% 
+    filter(event_type != 'other') %>%
+    select(
+        REFNUM, event_year, event_month, event_type, damages_adjusted, FATALITIES, INJURIES
+    ) %>%
+    rename(
+        refnum = REFNUM,
+        deaths = FATALITIES,
+        injuries = INJURIES
+    ) %>% mutate(
+        log10_damages = log10(damages_adjusted+1)
+    )
+    
+```
+
+
+
+# Results 
+
+
+### Average effects per event by type
+
+```{r}
+effects_per_event <- storm_data_filtered %>%
+    group_by(event_type) %>%
+    summarize(
+        nr_events = n(),
+        avg_damages = mean(damages_adjusted,na.rm=TRUE),
+        median_damages = median(damages_adjusted,na.rm=TRUE),
+        avg_deaths = mean(deaths),
+        avg_injuries = mean(injuries)
+    ) %>%
+    arrange(desc(avg_deaths)) %>% data.frame
+
+effects_per_event
+```
+
+Some events have many more observations and may be more common throughout the year
+
+```{r}
+effects_per_event$event_type_factor <-  factor(effects_per_event$event_type,levels = as.character(effects_per_event[order(effects_per_event$nr_events),'event_type']))
+```
+
+```{r}
+ggplot(effects_per_event,aes(event_type_factor,nr_events))+
+    geom_bar(stat='identity')+
+    coord_flip()+
+    ylab("Total number of events")+xlab(NULL)
+```
+
+In this plot we can see that thunderstorms and hail are extremely common, followed by floods, tornadoes, and winter storms. Tsunamis and Hurricanes and very rare by comparison.
+
+
+
+### Yearly total effects by event type
+
+Hurricanes are very rare but we will see later that they appear to have a large impact per event, whereas more frequent events such as floods may have a smaller average impact but the total impact over time may add up. Because of this large disparity in frequencies, we will next add up the total effects of each event type over each year.
+
+```{r}
+yearly_storm_events <- storm_data_filtered %>%
+    group_by(event_year,event_type) %>%
+    summarize(
+        nr_events = n(),
+        total_damages = sum(damages_adjusted,na.rm=TRUE),
+        damages_millions = total_damages/1e6,
+        total_deaths = sum(deaths),
+        total_injuries = sum(injuries)
+    )
+```
+
+#### Frequency of event types recorded by year
+
+```{r}
+ggplot(yearly_storm_events,aes(event_year,nr_events,color=event_type))+
+    geom_line()+
+    geom_text(data=subset(yearly_storm_events,event_year==2011 & nr_events > 2000),aes(event_year,nr_events,color=event_type,label=event_type),hjust = "inward")+
+    theme(legend.position="none")
+```
+
+From this time series plot we can see that before the mid nineties, only thunderstorms, hail, and tornadoes were recorded, so we should be cautious about not comparing total counts across the entire time range of the dataset, but instead should look at averages per year. We can also see that the number of many of these type of events are increasing over time.
+
+
+### Average yearly effects per event type
+
+```{r}
+avg_impact_per_year <- yearly_storm_events %>%
+    group_by(event_type) %>%
+    summarize(
+        nr_events = sum(nr_events),
+        avg_yearly_damages = mean(total_damages),
+        median_yearly_damages = median(total_damages),
+        avg_yearly_deaths = mean(total_deaths),
+        median_yearly_deaths = median(total_deaths),
+        avg_yearly_injuries = mean(total_injuries),
+        median_yearly_injuries = median(total_injuries)
+    ) %>% data.frame
+    
+```
+
+
+
+### Plot the effect per event by type
+
+Let's next plot the distribution of each outcome per event type using boxplots
+
+```{r}
+top5deaths_per_year <- avg_impact_per_year %>% arrange(desc(avg_yearly_deaths)) %>% head(5) %>% select(event_type) 
+top5injuries_per_year <- avg_impact_per_year %>% arrange(desc(avg_yearly_injuries)) %>% head(5) %>% select(event_type) 
+top5damages_per_year <- avg_impact_per_year %>% arrange(desc(avg_yearly_damages)) %>% head(5) %>% select(event_type)
+
+top_impact_per_year <- unique(unlist(c(top5deaths_per_year,top5injuries_per_year,top5damages_per_year)))
+
+top_effects_per_year <- data.frame(yearly_storm_events %>% filter(event_type %in% top_impact_per_year))
+```
+
+
+```{r}
+yearly_storm_events_long <- yearly_storm_events %>%
+    filter(event_type %in% top_impact_per_year) %>%
+    pivot_longer(
+        names_to = 'outcome',
+        cols = c(damages_millions,total_deaths,total_injuries)
+    )
+```
+
+```{r}
+
+yearly_storm_events_long$event_type_factor <- factor(yearly_storm_events_long$event_type,levels = as.character(avg_impact_per_year[order(avg_impact_per_year$median_yearly_damages),'event_type']))
+
+yearly_storm_events_long$damanges_millions <- yearly_storm_events_long$total_damages/1e6
+```
+
+```{r}
+# note: add 1 to the value so values of zero can be log transformed
+ggplot(yearly_storm_events_long,aes(value+1,event_type_factor,color=event_type))+
+    geom_boxplot()+
+    facet_wrap(~outcome,nrow = 1,scales = 'free_x') + 
+    theme(legend.position='none')+
+    scale_x_log10(label=label_number_si()) +
+    ylab(NULL)+xlab(NULL)
+```
+From these boxplots we can see that floods, tornadoes and hurricanes cause a lot of damage; floods, tornadoes and heat cause a lot of deaths and injuries. 
+We can also see that hurricanes, storm surges, and excessive heat have high variability in their yearly impact, whereas floods and lightning have a more consistent impact across years.
+
+
+## Top event types per outcome
+We will use the median yearly impact because there are extreme outliers for each outcome
+
+### Median yearly damages
+
+Floods create the highest median damages per year, followed by tornadoes and hurricanes.
+
+```{r}
+avg_impact_per_year %>% 
+    select(event_type,nr_events,avg_yearly_damages,median_yearly_damages) %>%
+    arrange(desc(median_yearly_damages)) %>%
+    head(3)
+```
+### Median yearly deaths
+
+Excessive heat leads to the most deaths per year, followed by floods and tornadoes.
+
+```{r}
+avg_impact_per_year %>% 
+    select(event_type,nr_events,avg_yearly_deaths,median_yearly_deaths) %>%
+    arrange(desc(median_yearly_deaths)) %>%
+    head(3)
+```
+
+### Median yearly injuries
+
+Tornadoes lead to the most injuries per year, followed by heat and lightning.
+
+```{r}
+avg_impact_per_year %>% 
+    select(event_type,nr_events,avg_yearly_injuries,median_yearly_injuries) %>%
+    arrange(desc(median_yearly_injuries)) %>%
+    head(3)
+```
+
+
+
+# Summary of findings
+
+- Floods have a high economic and public health impact, being the third most frequent event per year and causing the highest median damages at $2.6B per year and cause the second highest median deaths at 79 per year
+- Tornadoes also have a high impact, being the fourth more common event and causing the highest median injuries at 1060 per year, second highest median damages at $1.4B, and third highest median yearly deaths at 57 per year
+- Excessive heat is the most deadly event at median 83 per year, but has a relatively small economic impact compared to floods, tornadoes, and hurricanes
+- Hurricanes are relatively infrequent, but they tend to have a large economic impact, causing the third highest median damages at $1.1B per year
+
+
